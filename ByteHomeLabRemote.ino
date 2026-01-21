@@ -4,8 +4,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <FastLED.h>
+#include <ArduinoJson.h>
 
-/* ================= HARDWARE ================= */
 #define TFT_CS     14
 #define TFT_RST    21
 #define TFT_DC     15
@@ -28,20 +28,22 @@
 #define ITEMS_PER_PAGE 5
 #define ITEM_HEIGHT 26
 
+#define MAX_AREAS    10
+#define MAX_DEVICES  12
+#define NAME_LEN     64
+
 Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 CRGB leds[NUM_LEDS];
 
-/* ================= CORES ================= */
 #define LED_IDLE   CRGB(143,143,143)
 #define LED_MOVE   CRGB(1,122,255)
 #define LED_OK     CRGB(125,184,82)
 
-/* ================= WIFI ================= */
-const char* WIFI_SSID = "WIFI";
-const char* WIFI_PASS = "SENHA";
-const char* HA_URL    = "http://IP:8123/";
 
-/* ================= UTIL ================= */
+const char* WIFI_SSID = "WIFI_SSID";
+const char* WIFI_PASS = "WIFI_PASSWORD";
+const char* NODE_RED_URL    = "http://SEU_IP:1880/";
+
 uint16_t rgb565(uint8_t r,uint8_t g,uint8_t b){
   return ((r & 0xF8) << 8)|((g & 0xFC) << 3)|(b >> 3);
 }
@@ -49,18 +51,15 @@ uint16_t hexTo565(uint32_t hex){
   return rgb565(hex>>16,hex>>8,hex);
 }
 
-/* ================= LED ================= */
 void ledIdle(){ leds[0]=LED_IDLE; FastLED.show(); }
 void ledPulse(CRGB c){ leds[0]=c; FastLED.show(); delay(120); ledIdle(); }
 
-/* ================= STATUS ================= */
-enum HAStatus { NO_WIFI, WIFI_ONLY, HA_OK };
+enum NodeRedStatus { NO_WIFI, WIFI_ONLY, NODE_RED_OK };
 enum AppState { APP_LOADING, APP_ERROR, APP_READY };
 
-HAStatus haStatus = NO_WIFI;
+NodeRedStatus NodeRedStatus = NO_WIFI;
 AppState appState = APP_LOADING;
 
-/* ================= MENU ENGINE ================= */
 struct Menu {
   const char* title;
   const char** items;
@@ -70,7 +69,7 @@ struct Menu {
 enum MenuLevel {
   MENU_AREA,
   MENU_DEVICE,
-  MENU_ACTION
+  MENU_SENSOR_VALUE
 };
 
 struct MenuState {
@@ -94,13 +93,35 @@ MenuLevel currentLevel = MENU_AREA;
 int selectedItem = 0;
 int firstVisibleItem = 0;
 
-/* ================= MOCK DATA ================= */
-const char* areas[] = {"Sala","Quarto","Cozinha","Banheiro","Corredor","Externo","Quarto 2"};
-const char* sala_devices[] = {"Luz","TV","Sensor"};
-const char* quarto_devices[] = {"Luz","Ar"};
+char selectedAreaId[NAME_LEN];
+
+struct Area {
+  char id[NAME_LEN];
+  char name[NAME_LEN];
+};
+
+struct Device {
+  char id[NAME_LEN];
+  char name[NAME_LEN];
+};
+
+struct SensorValue {
+  float value;
+  char unit[8];
+  bool valid;
+};
+
+SensorValue currentSensor;
+Area areaList[MAX_AREAS];
+Device deviceList[MAX_DEVICES];
+
+const char* areaItems[MAX_AREAS];
+const char* deviceItems[MAX_DEVICES];
 const char* actions_onoff[] = {"Ligar","Desligar"};
 
-/* ================= STACK ================= */
+int areaCount = 0;
+int deviceCount = 0;
+
 void pushMenu() {
   if(menuStackTop >= MENU_STACK_SIZE - 1) return;
 
@@ -135,9 +156,10 @@ bool popMenu() {
 void reconnectAll()
 {
   connectWiFi();
-  checkHA();
+  checkServer();
 }
-/* ================= WIFI ================= */
+
+
 bool connectWiFi(){
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -149,24 +171,84 @@ bool connectWiFi(){
   return true;
 }
 
-void checkHA(){
+void checkServer(){
   if(WiFi.status()!=WL_CONNECTED){
-    haStatus = NO_WIFI;
+    NodeRedStatus = NO_WIFI;
     appState = APP_ERROR;
     return;
   }
   HTTPClient http;
-  http.begin(HA_URL);
+  http.begin(NODE_RED_URL);
   int code = http.GET();
   http.end();
-  haStatus = code > 0 ? HA_OK : WIFI_ONLY;
-  appState = (haStatus == HA_OK) ? APP_READY : APP_ERROR;
+  NodeRedStatus = code > 0 ? NODE_RED_OK : WIFI_ONLY;
+  appState = (NodeRedStatus == NODE_RED_OK) ? APP_READY : APP_ERROR;
 }
 
-/* ================= UI ================= */
+bool fetchAreas(){
+  HTTPClient http;
+  http.begin(String(NODE_RED_URL)+"PegarAreas");
+  if(http.GET()!=200){ http.end(); return false; }
+
+  StaticJsonDocument<1024> doc;
+  deserializeJson(doc, http.getString());
+  http.end();
+
+  areaCount = 0;
+  for(JsonObject o : doc.as<JsonArray>()){
+    if(areaCount>=MAX_AREAS) break;
+    strcpy(areaList[areaCount].id,   o["id"]);
+    strcpy(areaList[areaCount].name, o["name"]);
+    areaItems[areaCount] = areaList[areaCount].name;
+    areaCount++;
+  }
+  return areaCount>0;
+}
+
+bool fetchDevices(const char* areaId){
+  HTTPClient http;
+  http.begin(String(NODE_RED_URL)+"PegarDispositivos?area_id="+String(areaId));
+  if(http.GET()!=200){ http.end(); return false; }
+
+  StaticJsonDocument<2048> doc;
+  deserializeJson(doc, http.getString());
+  http.end();
+
+  deviceCount = 0;
+  for(JsonObject o : doc.as<JsonArray>()){
+    if(deviceCount>=MAX_DEVICES) break;
+    strcpy(deviceList[deviceCount].id,   o["id"]);
+    strcpy(deviceList[deviceCount].name, o["name"]);
+    deviceItems[deviceCount] = deviceList[deviceCount].name;
+    deviceCount++;
+  }
+  return deviceCount>0;
+}
+
+bool fetchSensorValue(const char* deviceId) {
+  HTTPClient http;
+  http.begin(String(NODE_RED_URL)+"PegarValorDispositivo?device_id="+String(deviceId));
+
+  if (http.GET() != 200) {
+    http.end();
+    return false;
+  }
+
+  StaticJsonDocument<512> doc;
+  deserializeJson(doc, http.getString());
+  http.end();
+
+  currentSensor.value = doc["value"] | 0;
+  strcpy(currentSensor.unit, doc["unit"] | "");
+  currentSensor.valid = true;
+
+  return true;
+}
+
+
 uint16_t statusColor(){
-  if(haStatus==NO_WIFI) return hexTo565(0xFF3B30);
-  if(haStatus==WIFI_ONLY) return hexTo565(0xFF9500);
+  if(NodeRedStatus==NO_WIFI) return hexTo565(0xFF3B30);
+  if(NodeRedStatus==WIFI_ONLY) return hexTo565(0xFF9500);
   return hexTo565(0x34C759);
 }
 
@@ -195,14 +277,12 @@ void drawErrorScreen(){
   tft.setCursor(30, 60);
   tft.print("Falha de conexao");
 
-  if(haStatus == NO_WIFI){
+  if(NodeRedStatus == NO_WIFI){
     tft.setCursor(30, 90);
-    tft.print("Wi-Fi nao conectado");
+    tft.print("Wi-Fi");
   } else {
     tft.setCursor(30, 90);
-    tft.print("Home Assistant");
-    tft.setCursor(30, 110);
-    tft.print("nao encontrado");
+    tft.print("NodeRed");
   }
 
   tft.setTextSize(1);
@@ -212,62 +292,76 @@ void drawErrorScreen(){
   tft.print("para tentar novamente");
 }
 
+void drawSensorValueScreen(const char* title) {
+  tft.fillScreen(hexTo565(0xffffff));
+  drawHeader(title);
 
-void clearListArea(){
+  tft.setTextColor(hexTo565(0x181617));
+  tft.setTextSize(3);
+
+  tft.setCursor(60, 70);
+  if (currentSensor.valid) {
+    tft.print(currentSensor.value, 1);
+    tft.print(" ");
+    tft.print(currentSensor.unit);
+  } else {
+    tft.print("--");
+  }
+  tft.setTextSize(1);
+  tft.setCursor(40, 145);
+  tft.print("SET para voltar");
+}
+
+
+
+void clearList(){
   tft.fillRect(12, HEADER_HEIGHT + 2, 296, 172 - HEADER_HEIGHT - 6, hexTo565(0xffffff));
 }
 
 void drawMenu(){
   drawHeader(activeMenu.title);
-  clearListArea();
+  clearList();
   tft.setTextSize(2);
 
   for(int i=0;i<ITEMS_PER_PAGE;i++){
-    int idx = firstVisibleItem + i;
-    if(idx >= activeMenu.size) break;
+    int idx = firstVisibleItem+i;
+    if(idx>=activeMenu.size) break;
+    int y = HEADER_HEIGHT+8+i*ITEM_HEIGHT;
 
-    int y = HEADER_HEIGHT + 8 + i * ITEM_HEIGHT;
-
-    if(idx == selectedItem){
+    if(idx==selectedItem){
       tft.fillRoundRect(20,y-2,280,ITEM_HEIGHT,8,hexTo565(0x017aff));
       tft.setTextColor(hexTo565(0xffffff));
-      tft.setCursor(26,y+5); tft.print(">");
     } else {
       tft.setTextColor(hexTo565(0x181617));
     }
-    tft.setCursor(42,y+5);
+    tft.setCursor(30,y+6);
     tft.print(activeMenu.items[idx]);
   }
 }
 
-/* ================= FLOW ================= */
 void enterMenu(){
   ledPulse(LED_OK);
-
-  // salva menu atual COMPLETO
   pushMenu();
 
-  // novo título = item selecionado
-  strncpy(dynamicTitle,
-          activeMenu.items[selectedItem],
-          sizeof(dynamicTitle));
-  dynamicTitle[sizeof(dynamicTitle)-1] = '\0';
+  strcpy(dynamicTitle, activeMenu.items[selectedItem]);
 
-  selectedItem = 0;
-  firstVisibleItem = 0;
-
-  if(currentLevel == MENU_AREA){
-    activeMenu = { dynamicTitle, sala_devices, 3 };
+  if(currentLevel==MENU_AREA){
+    strcpy(selectedAreaId, areaList[selectedItem].id);
+    fetchDevices(selectedAreaId);
+    delay(120);
+    activeMenu = { dynamicTitle, deviceItems, deviceCount };
     currentLevel = MENU_DEVICE;
   }
   else if(currentLevel == MENU_DEVICE){
-    activeMenu = { dynamicTitle, actions_onoff, 2 };
-    currentLevel = MENU_ACTION;
+    fetchSensorValue(deviceList[selectedItem].id);
+    currentLevel = MENU_SENSOR_VALUE;
+    drawSensorValueScreen(dynamicTitle);
+    return;
   }
-
+  selectedItem=0;
+  firstVisibleItem=0;
   drawMenu();
 }
-
 
 void backMenu(){
   ledPulse(LED_OK);
@@ -276,7 +370,6 @@ void backMenu(){
   }
 }
 
-/* ================= SETUP ================= */
 void setup(){
   Serial.begin(115200);
 
@@ -299,19 +392,17 @@ void setup(){
   tft.setRotation(1);
   tft.fillScreen(hexTo565(0xffffff));
   drawFrame();
-
   connectWiFi();
-  checkHA();
-
-  activeMenu = {"ByteHomeLab", areas, 7};
-  if(appState == APP_READY){
+  checkServer();
+  if (appState == APP_READY && fetchAreas()) {
+    activeMenu = { "ByteHomeLab", areaItems, areaCount };
     drawMenu();
   } else {
+    appState = APP_ERROR;
     drawErrorScreen();
   }
 }
 
-/* ================= LOOP ================= */
 unsigned long lastInput = 0;
 
 void loop(){
@@ -334,6 +425,12 @@ void loop(){
       delay(500);
     }
 
+    return;
+  }
+  if (currentLevel == MENU_SENSOR_VALUE) {
+    if (!digitalRead(JOY_SET) || !digitalRead(JOY_LEFT)) {
+      backMenu();
+    }
     return;
   }
 
