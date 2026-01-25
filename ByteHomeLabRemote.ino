@@ -40,9 +40,9 @@ CRGB leds[NUM_LEDS];
 #define LED_OK     CRGB(125,184,82)
 
 
-const char* WIFI_SSID = "WIFI_SSID";
-const char* WIFI_PASS = "WIFI_PASSWORD";
-const char* NODE_RED_URL    = "http://SEU_IP:1880/";
+const char* WIFI_SSID = "Patrick";
+const char* WIFI_PASS = "*P4ssw0rd";
+const char* NODE_RED_URL    = "http://192.168.18.48:1880/";
 
 uint16_t rgb565(uint8_t r,uint8_t g,uint8_t b){
   return ((r & 0xF8) << 8)|((g & 0xFC) << 3)|(b >> 3);
